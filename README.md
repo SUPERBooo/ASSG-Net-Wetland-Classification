@@ -1,6 +1,6 @@
 # ASSG-Net: Adaptive Scale and Sparse Graph Network via Gated Fusion for Wetland Vegetation Classification
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.xxxxxxx.svg)](https://doi.org/10.5281/zenodo.xxxxxxx)
+[![DOI](https://zenodo.org/badge/1174706758.svg)](https://doi.org/10.5281/zenodo.18894511)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PyTorch 1.13.1](https://img.shields.io/badge/PyTorch-1.13.1-EE4C2C.svg)](https://pytorch.org/)
 
