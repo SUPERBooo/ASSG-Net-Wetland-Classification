@@ -1,353 +1,295 @@
-# -------------------- train.py --------------------
-import os
+from __future__ import annotations
+
+import json
+import random
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
+from tqdm import tqdm
 
-from sklearn.metrics import (
-    confusion_matrix, cohen_kappa_score, accuracy_score,
-    recall_score, precision_score, f1_score
-)
-
-from model import FusionModel
-from dataloader import get_dataloaders, RemoteSensingDataset
 from configs import config
+from dataloader import get_dataloaders
+from model import FusionModel, count_parameters
 
 
-# =========================
-# 损失函数：Focal CE（支持label smoothing、类权重、ignore_index）
-# =========================
-def focal_ce_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    weight: torch.Tensor = None,
-    ignore_index: int = 0,
-    gamma: float = 1.5,
-    label_smoothing: float = 0.05
-) -> torch.Tensor:
-    """
-    logits: [B,C,H,W], targets: [B,H,W]
-    使用 F.cross_entropy(reduction='none', label_smoothing=...) 得到每像素CE，
-    然后乘以 focal 权重 ((1-pt)^gamma)，再对有效像素平均。
-    """
-    B, C, H, W = logits.shape
-
-    # 每像素 CE（未聚合）
-    ce_map = F.cross_entropy(
-        logits, targets,
-        weight=weight,
-        ignore_index=ignore_index,
-        reduction='none',
-        label_smoothing=label_smoothing
-    )  # [B,H,W]
-
-    # pt：目标类的概率
-    with torch.no_grad():
-        probs = F.softmax(logits, dim=1)                        # [B,C,H,W]
-        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)   # [B,H,W]
-        pt = torch.clamp(pt, min=1e-6, max=1.0)
-
-    focal_w = (1.0 - pt) ** gamma                               # [B,H,W]
-
-    # 只统计有效像素
-    mask = (targets != ignore_index).float()                    # [B,H,W]
-    loss = (focal_w * ce_map * mask).sum() / torch.clamp(mask.sum(), min=1.0)
-    return loss
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-# =========================
-# Tversky Loss（更稳的Dice变体）
-# =========================
-def tversky_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    alpha: float = 0.6,
-    beta: float = 0.4,
-    eps: float = 1e-6,
-    ignore_index: int = 0,
-    num_classes: int = 6
-) -> torch.Tensor:
-    """
-    logits: [B,C,H,W], targets: [B,H,W]
-    对 ignore 像素不参与计算。
-    """
-    probs = F.softmax(logits, dim=1)
-    B, C, H, W = probs.shape
+def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, object]:
+    labels = np.asarray(config.valid_classes, dtype=np.int64)
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    tp = np.diag(cm).astype(np.float64)
+    support = cm.sum(axis=1).astype(np.float64)
+    pred_count = cm.sum(axis=0).astype(np.float64)
 
-    mask = (targets != ignore_index).float()                    # [B,H,W]
-    targets_clamped = targets.clone()
-    targets_clamped[targets == ignore_index] = 0
-
-    onehot = F.one_hot(targets_clamped, num_classes=C).permute(0, 3, 1, 2).float()
-    onehot = onehot * mask.unsqueeze(1)
-    probs = probs * mask.unsqueeze(1)
-
-    TP = (probs * onehot).sum(dim=(0, 2, 3))
-    FP = (probs * (1.0 - onehot)).sum(dim=(0, 2, 3))
-    FN = ((1.0 - probs) * onehot).sum(dim=(0, 2, 3))
-
-    tversky = (TP + eps) / (TP + alpha * FP + beta * FN + eps)
-    return 1.0 - tversky.mean()
-
-
-# =========================
-# EMA（Exponential Moving Average）辅助
-# =========================
-def init_ema_state(model: nn.Module) -> dict:
-    # 直接用当前权重初始化 shadow
-    return {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-@torch.no_grad()
-def ema_update(model: nn.Module, ema_state: dict, decay: float = 0.999):
-    msd = model.state_dict()
-    for k, v in msd.items():
-        if k in ema_state:
-            ema_state[k].mul_(decay).add_(v, alpha=1.0 - decay)
-        else:
-            ema_state[k] = v.detach().clone()
-
-@torch.no_grad()
-def swap_to_ema_weights(model: nn.Module, ema_state: dict):
-    """
-    用 EMA 权重替换当前模型权重，同时返回原始权重备份，便于验证后恢复。
-    """
-    backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(ema_state, strict=False)
-    return backup
-
-@torch.no_grad()
-def load_state_dict_safe(model: nn.Module, state: dict):
-    model.load_state_dict(state, strict=False)
-
-
-def train():
-    os.makedirs(os.path.dirname(config.model_save_path), exist_ok=True)
-    os.makedirs(config.metrics_dir, exist_ok=True)
-    os.makedirs(config.confusion_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(config.seed)
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
-
-    # 首次运行会计算统计量 & 生成超像素
-    stats_path = os.path.join(config.output_dir, "dataset_stats.npz")
-    if not os.path.exists(stats_path):
-        print("首次运行，正在计算数据统计量并生成超像素...")
-        _ = RemoteSensingDataset(config.output_dir)
-
-    # 构建数据集/加载器
-    full_dataset = RemoteSensingDataset(config.output_dir)
-    train_loader, val_loader = get_dataloaders(config.output_dir, config.batch_size)
-
-    # ======== 类权重：log(1 + 1/freq)，不归一 ========
-    class_counts = full_dataset.class_counts
-    print("\n原始类别分布:", class_counts)
-    valid_classes = list(range(1, config.num_classes))
-    if len(class_counts) < config.num_classes:
-        raise ValueError(f"数据只包含 {len(class_counts)} 个类别，但配置要求 {config.num_classes} 个")
-
-    valid_counts = class_counts[valid_classes]
-    print("有效类别样本数:", valid_counts)
-
-    eps = 1e-8
-    inv_freq = 1.0 / (valid_counts.astype(np.float64) + eps)    # 反频率
-    log_inv = np.log(1.0 + inv_freq)                            # 压制极端值
-    print("log反频率（未归一）:", np.round(log_inv, 6))
-
-    full_weights = np.zeros(config.num_classes, dtype=np.float32)
-    full_weights[valid_classes] = log_inv.astype(np.float32)
-    print("最终权重分配:", np.round(full_weights, 6))
-
-    weights_tensor = torch.tensor(full_weights, dtype=torch.float32, device=device)
-
-    # ======== 模型 / 优化器 / 调度器 ========
-    model = FusionModel().to(device)
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        print(f"使用 {torch.cuda.device_count()} 块GPU")
-
-    # 初始 lr=2e-4 + warmup=10 epoch
-    base_lr = 2e-4
-    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
-
-    # 使用 ReduceLROnPlateau 基于验证 OA 调整学习率（warmup 之后照常工作）
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=3, factor=0.5, verbose=True
+    recall = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
+    precision = np.divide(tp, pred_count, out=np.zeros_like(tp), where=pred_count > 0)
+    f1 = np.divide(
+        2 * precision * recall,
+        precision + recall,
+        out=np.zeros_like(tp),
+        where=(precision + recall) > 0,
     )
+    union = support + pred_count - tp
+    iou = np.divide(tp, union, out=np.zeros_like(tp), where=union > 0)
 
-    # ======== EMA ========
-    ema_decay = 0.999
-    ema_state = init_ema_state(model)
+    oa = accuracy_score(y_true, y_pred)
+    aa = float(recall.mean())
+    kappa = cohen_kappa_score(y_true, y_pred, labels=labels)
+    macro_f1 = float(f1.mean())
+    miou = float(iou.mean())
 
-    # ======== 训练监控 ========
-    metrics = []
-    best_acc = 0.0
-    warmup_epochs = 10
-    focal_gamma = 1.5
-    tv_alpha, tv_beta = 0.6, 0.4
-    tv_weight = 0.2  # Tversky损失的权重
-    lbl_smooth = 0.05
+    return {
+        "oa": float(oa),
+        "aa": aa,
+        "kappa": float(kappa),
+        "macro_f1": macro_f1,
+        "miou": miou,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "iou": iou,
+        "confusion_matrix": cm,
+    }
 
-    for epoch in range(config.epochs):
-        # ---- Warmup：线性提升到 base_lr ----
-        if epoch < warmup_epochs:
-            lr_now = base_lr * float(epoch + 1) / float(warmup_epochs)
-            for pg in optimizer.param_groups:
-                pg['lr'] = lr_now
 
-        # ========== Train ==========
-        model.train()
-        train_loss = 0.0
-        train_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.epochs} [Train]')
+def run_epoch(
+    model: nn.Module,
+    loader,
+    criterion: nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
+    desc: str,
+) -> Tuple[float, float, Dict[str, object]]:
+    training = optimizer is not None
+    model.train(training)
 
-        for radar, optical, labels, spx in train_bar:
+    total_loss = 0.0
+    total_cls = 0.0
+    all_true: List[np.ndarray] = []
+    all_pred: List[np.ndarray] = []
+
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        bar = tqdm(loader, desc=desc)
+        for radar, optical, labels, superpixels, _ in bar:
             radar = radar.to(device, non_blocking=True)
             optical = optical.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            spx = spx.to(device, non_blocking=True)
+            superpixels = superpixels.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
 
-            logits, reg_loss = model(radar, optical, spx)
+            logits, sparse_loss = model(radar, optical, superpixels)
+            cls_loss = criterion(logits, labels)
+            loss = cls_loss + config.sparsity_lambda * sparse_loss
 
-            # 分离出两部分损失
-            ce = focal_ce_loss(
-                logits, labels,
-                weight=weights_tensor,
-                ignore_index=config.ignore_index,
-                gamma=focal_gamma,
-                label_smoothing=lbl_smooth
-            )
-            tv = tversky_loss(
-                logits, labels,
-                alpha=tv_alpha, beta=tv_beta,
-                ignore_index=config.ignore_index,
-                num_classes=config.num_classes
-            )
-            seg_loss = 0.8 * ce + tv_weight * tv
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss detected: {loss.item()}")
 
-            if torch.isnan(seg_loss):
-                raise RuntimeError("训练过程中出现NaN损失，请检查数据！")
+            if training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-            total_loss = seg_loss + config.agsm_reg_lambda * reg_loss
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            total_loss += float(loss.item())
+            total_cls += float(cls_loss.item())
 
-            # EMA 更新
-            if isinstance(model, nn.DataParallel):
-                ema_update(model.module, ema_state, decay=ema_decay)
-            else:
-                ema_update(model, ema_state, decay=ema_decay)
+            pred = logits.argmax(dim=1)
+            mask = labels != config.ignore_index
+            all_true.append(labels[mask].detach().cpu().numpy())
+            all_pred.append(pred[mask].detach().cpu().numpy())
 
-            train_loss += float(total_loss.item())
-            train_bar.set_postfix(
-                loss=float(total_loss.item()),
-                seg=float(seg_loss.item()),
-                ce=float(ce.item()),
-                tv=float(tv.item()),
-                reg=float(reg_loss.item())
+            bar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                cls=f"{cls_loss.item():.4f}",
+                sparse=f"{sparse_loss.item():.4f}",
             )
 
-        # ========== Validation（使用 EMA 权重评估，更稳） ==========
-        model.eval()
-        # 切换到 EMA 权重
-        if isinstance(model, nn.DataParallel):
-            backup_state = swap_to_ema_weights(model.module, ema_state)
-        else:
-            backup_state = swap_to_ema_weights(model, ema_state)
+    y_true = np.concatenate(all_true) if all_true else np.array([], dtype=np.int64)
+    y_pred = np.concatenate(all_pred) if all_pred else np.array([], dtype=np.int64)
+    metrics = calculate_metrics(y_true, y_pred)
+    return total_loss / max(len(loader), 1), total_cls / max(len(loader), 1), metrics
 
-        val_loss = 0.0
-        all_preds, all_labels = [], []
-        val_bar = tqdm(val_loader, desc=f'Epoch {epoch + 1}/{config.epochs} [Val]')
-        with torch.no_grad():
-            for radar, optical, labels, spx in val_bar:
-                radar = radar.to(device, non_blocking=True)
-                optical = optical.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                spx = spx.to(device, non_blocking=True)
 
-                logits, _ = model(radar, optical, spx)
+def flatten_metrics(prefix: str, metrics: Dict[str, object]) -> Dict[str, float]:
+    out: Dict[str, float] = {
+        f"{prefix}_oa": float(metrics["oa"]),
+        f"{prefix}_aa": float(metrics["aa"]),
+        f"{prefix}_kappa": float(metrics["kappa"]),
+        f"{prefix}_macro_f1": float(metrics["macro_f1"]),
+        f"{prefix}_miou": float(metrics["miou"]),
+    }
+    for j, cls in enumerate(config.valid_classes):
+        out[f"{prefix}_precision_{cls}"] = float(metrics["precision"][j])
+        out[f"{prefix}_recall_{cls}"] = float(metrics["recall"][j])
+        out[f"{prefix}_f1_{cls}"] = float(metrics["f1"][j])
+        out[f"{prefix}_iou_{cls}"] = float(metrics["iou"][j])
+    return out
 
-                # 与训练相同的损失口径
-                ce = focal_ce_loss(
-                    logits, labels,
-                    weight=weights_tensor,
-                    ignore_index=config.ignore_index,
-                    gamma=focal_gamma,
-                    label_smoothing=lbl_smooth
-                )
-                tv = tversky_loss(
-                    logits, labels,
-                    alpha=tv_alpha, beta=tv_beta,
-                    ignore_index=config.ignore_index,
-                    num_classes=config.num_classes
-                )
-                loss = 0.8 * ce + tv_weight * tv
-                val_loss += float(loss.item())
 
-                # 评估
-                _, preds = torch.max(logits.permute(0, 2, 3, 1).reshape(-1, config.num_classes), dim=1)
-                mask = labels.reshape(-1) != config.ignore_index
-                valid_preds = preds[mask].cpu().numpy()
-                valid_l = labels.reshape(-1)[mask].cpu().numpy()
-                all_preds.extend(valid_preds)
-                all_labels.extend(valid_l)
+def train_one_run(run_idx: int, seed: int, train_loader, val_loader, test_loader, weights: np.ndarray):
+    set_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-                val_bar.set_postfix(loss=float(loss.item()))
+    model = FusionModel().to(device)
+    print(f"Run {run_idx + 1}: trainable parameters = {count_parameters(model):,} ({count_parameters(model)/1e6:.3f} M)")
 
-        # 恢复原训练权重
-        if isinstance(model, nn.DataParallel):
-            load_state_dict_safe(model.module, backup_state)
-        else:
-            load_state_dict_safe(model, backup_state)
+    weight_t = torch.tensor(weights, dtype=torch.float32, device=device)
+    criterion = nn.CrossEntropyLoss(weight=weight_t, ignore_index=config.ignore_index)
 
-        # 计算指标
-        oa = accuracy_score(all_labels, all_preds)
-        valid_classes = list(range(1, config.num_classes))
-        aa = recall_score(all_labels, all_preds, average='macro', labels=valid_classes, zero_division=0)
-        kappa = cohen_kappa_score(all_labels, all_preds, labels=valid_classes)
-        precision_per_class = precision_score(all_labels, all_preds, average=None, labels=np.arange(config.num_classes), zero_division=0)
-        recall_per_class = recall_score(all_labels, all_preds, average=None, labels=np.arange(config.num_classes), zero_division=0)
-        f1_per_class = f1_score(all_labels, all_preds, average=None, labels=np.arange(config.num_classes), zero_division=0)
-        conf_matrix = confusion_matrix(all_labels, all_preds, labels=np.arange(config.num_classes))
-        np.save(os.path.join(config.confusion_dir, f'confusion_matrix_epoch_{epoch + 1}.npy'), conf_matrix)
+    # Manuscript says Adam; use Adam rather than AdamW for implementation-text consistency.
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
-        epoch_metrics = {
-            'epoch': epoch + 1,
-            'phase': 'val',
-            'loss': val_loss / max(len(val_loader), 1),
-            'oa': oa, 'aa': aa, 'kappa': kappa
+    run_dir = config.metrics_dir / f"run_{run_idx + 1}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config.checkpoints_path.mkdir(parents=True, exist_ok=True)
+    config.confusion_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = config.checkpoints_path / f"best_model_run_{run_idx + 1}.pth"
+
+    best_val_oa = -1.0
+    history: List[Dict[str, float]] = []
+
+    for epoch in range(1, config.epochs + 1):
+        train_loss, train_cls, train_metrics = run_epoch(
+            model, train_loader, criterion, device, optimizer,
+            desc=f"Run {run_idx + 1} Epoch {epoch}/{config.epochs} [Train]",
+        )
+        val_loss, val_cls, val_metrics = run_epoch(
+            model, val_loader, criterion, device, None,
+            desc=f"Run {run_idx + 1} Epoch {epoch}/{config.epochs} [Val]",
+        )
+
+        row: Dict[str, float] = {
+            "run": run_idx + 1,
+            "seed": seed,
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_cls_loss": train_cls,
+            "val_loss": val_loss,
+            "val_cls_loss": val_cls,
         }
-        for i in range(config.num_classes):
-            epoch_metrics[f'precision_{i}'] = precision_per_class[i]
-            epoch_metrics[f'recall_{i}'] = recall_per_class[i]
-            epoch_metrics[f'f1_{i}'] = f1_per_class[i]
-        metrics.append(epoch_metrics)
-        pd.DataFrame(metrics).to_csv(os.path.join(config.metrics_dir, 'metrics.csv'), index=False)
+        row.update(flatten_metrics("train", train_metrics))
+        row.update(flatten_metrics("val", val_metrics))
+        history.append(row)
 
-        # 基于 OA 的调度器
-        scheduler.step(oa)
+        if config.save_every_epoch_metrics:
+            pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
 
-        # 保存最佳（保存 EMA 权重更实用）
-        if oa > best_acc:
-            best_acc = oa
-            # 用 EMA 权重保存
-            if isinstance(model, nn.DataParallel):
-                torch.save(ema_state, config.model_save_path)
-            else:
-                torch.save(ema_state, config.model_save_path)
-            print(f"保存最佳模型(EMA)，准确率：{best_acc:.2%}")
+        print(
+            f"Epoch {epoch}: val OA={val_metrics['oa']:.4f}, AA={val_metrics['aa']:.4f}, "
+            f"Kappa={val_metrics['kappa']:.4f}, mIoU={val_metrics['miou']:.4f}, "
+            f"Macro-F1={val_metrics['macro_f1']:.4f}"
+        )
 
-        # 打印 epoch 小结
-        print(f"[Epoch {epoch+1}] Val Loss={epoch_metrics['loss']:.4f} | OA={oa:.4f} | AA={aa:.4f} | Kappa={kappa:.4f}")
+        if float(val_metrics["oa"]) > best_val_oa:
+            best_val_oa = float(val_metrics["oa"])
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "seed": seed,
+                    "run": run_idx + 1,
+                    "epoch": epoch,
+                    "val_oa": best_val_oa,
+                    "class_weights": weights,
+                },
+                ckpt_path,
+            )
+            np.save(
+                config.confusion_dir / f"val_best_run_{run_idx + 1}.npy",
+                val_metrics["confusion_matrix"],
+            )
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+    test_loss, test_cls, test_metrics = run_epoch(
+        model, test_loader, criterion, device, None,
+        desc=f"Run {run_idx + 1} [Test]",
+    )
+
+    np.save(
+        config.confusion_dir / f"test_run_{run_idx + 1}.npy",
+        test_metrics["confusion_matrix"],
+    )
+
+    summary = {
+        "run": run_idx + 1,
+        "seed": seed,
+        "best_epoch": int(checkpoint["epoch"]),
+        "best_val_oa": float(checkpoint["val_oa"]),
+        "test_loss": test_loss,
+        "test_cls_loss": test_cls,
+    }
+    summary.update(flatten_metrics("test", test_metrics))
+    pd.DataFrame([summary]).to_csv(run_dir / "test_summary.csv", index=False)
+    return summary
+
+
+def main() -> None:
+    config.metrics_dir.mkdir(parents=True, exist_ok=True)
+    train_loader, val_loader, test_loader, class_counts, class_weights, split, stats = get_dataloaders()
+
+    print("Training pixel counts:", class_counts.tolist())
+    print("ICF class weights (mean=1 over classes 1..5):", np.round(class_weights, 4).tolist())
+    print(
+        f"Block split: train={len(split['train'])}, val={len(split['val'])}, test={len(split['test'])}"
+    )
+
+    with open(config.metrics_dir / "training_setup.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "class_counts": class_counts.tolist(),
+                "class_weights": class_weights.tolist(),
+                "split_sizes": {k: len(v) for k, v in split.items()},
+                "run_seeds": list(config.run_seeds),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    summaries = []
+    for run_idx, seed in enumerate(config.run_seeds):
+        summaries.append(
+            train_one_run(
+                run_idx,
+                seed,
+                train_loader,
+                val_loader,
+                test_loader,
+                class_weights,
+            )
+        )
+
+    df = pd.DataFrame(summaries)
+    df.to_csv(config.metrics_dir / "five_run_test_results.csv", index=False)
+
+    numeric_cols = [c for c in df.columns if c.startswith("test_") and c not in {"test_loss", "test_cls_loss"}]
+    agg_rows = []
+    for col in numeric_cols:
+        agg_rows.append(
+            {
+                "metric": col,
+                "mean": float(df[col].mean()),
+                "std": float(df[col].std(ddof=1)),
+            }
+        )
+    pd.DataFrame(agg_rows).to_csv(config.metrics_dir / "five_run_mean_std.csv", index=False)
+    print("Five-run results saved to:", config.metrics_dir)
 
 
 if __name__ == "__main__":
-    train()
+    main()

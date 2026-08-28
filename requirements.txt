@@ -1,0 +1,6 @@
+numpy
+pandas
+rasterio
+scikit-learn
+torch
+tqdm

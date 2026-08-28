@@ -1,86 +1,124 @@
-# -------------------- configs.py --------------------
+from __future__ import annotations
+
 import os
-from typing import Tuple, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Tuple
 
+
+@dataclass
 class Config:
-    # 输入路径
-    radar_path: str = r"D:\临洪ASSG\M学术科研1\原始图像\radar_bands_image.tif"
-    optical_path: str = r"D:\临洪ASSG\M学术科研1\原始图像\remaining_bands_image.tif"
-    label_path: str = r"D:\临洪ASSG\M学术科研1\原始图像\Land_use_classification.tif"
+    # ---------- Raw data ----------
+    radar_path: str = r"G:\H学术科研7\原始图像\radar_bands_image.tif"
+    optical_path: str = r"G:\H学术科研7\原始图像\remaining_bands_image.tif"
+    label_path: str = r"G:\H学术科研7\原始图像\Land_use_classification.tif"
+    # Optical input: retain all 10 bands from remaining_bands_image.tif.
+    # This is intentionally kept as the actual experimental setting.
+    optical_band_indices: Tuple[int, ...] = tuple(range(10))
 
-    # 输出路径
-    output_dir: str = r"D:\临洪ASSG\M学术科研1\处理后图像"
-    model_save_path: str = os.path.join(os.path.dirname(__file__), "checkpoints/best_model.pth")
-    pred_save_path: str = r"D:\临洪ASSG\M学术科研1\预测结果\prediction.tif"
+    # ---------- Output ----------
+    output_dir: str = r"G:\H学术科研7\处理后图像_v2"
+    checkpoint_dir: str = "checkpoints"
+    prediction_name: str = "prediction.tif"
 
-    # 指标/混淆矩阵
-    metrics_dir: str = os.path.join(output_dir, "metrics")
-    confusion_dir: str = os.path.join(output_dir, "confusion_matrices")
-
-    # 训练参数
-    batch_size: int = 32
-    epochs: int = 50
-    lr: float = 1e-4
-    val_ratio: float = 0.1
-    num_workers: int = 0 if os.name == 'nt' else 4
-    seed: int = 42
-
-    # 数据参数
+    # ---------- Label definition ----------
     num_classes: int = 6
     valid_classes: Tuple[int, ...] = (1, 2, 3, 4, 5)
     ignore_index: int = 0
+
+    # ---------- Input dimensions ----------
     block_size: int = 32
     radar_bands: int = 5
-    optical_bands: int = 10
+    optical_bands: int = 4
 
-    # 预测/整图尺寸（已更新为你提供的真实尺寸）
-    original_height: int = 623
-    original_width: int = 463
-    # 下面的块数只是估算，不影响程序运行
-    num_blocks_x: int = 15
-    total_blocks: int = 300
+    # ---------- Split ----------
+    # Manuscript Table 1 implies Yancheng ≈ 70/15/15.
+    # For Linhong, set train/val/test to ≈ 0.60/0.20/0.20 if you want to reproduce that table.
+    train_ratio: float = 0.70
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+    split_seed: int = 42
 
-    # -------- ASPM --------
-    aspm2_kernel_small = (3, 1)  # (kernel, dilation)
-    aspm2_kernel_large = (3, 3)
-    gate_down: int = 4
-    gate_channels: Optional[int] = None  # None -> max(C_in//2, 16)
-    gate_use_proxy: bool = True
-    aspm2_dropout: float = 0.1
+    # ---------- Training: manuscript-aligned defaults ----------
+    batch_size: int = 32
+    epochs: int = 100
+    lr: float = 5e-3
+    weight_decay: float = 0.0
+    num_workers: int = 0 if os.name == "nt" else 4
+    run_seeds: Tuple[int, ...] = (42,)
 
-    # -------- 超像素（整图生成）+ 贝叶斯优化 ----------
-    use_superpixels: bool = True
-    superpixel_dir: str = os.path.join(output_dir, "superpixels")
-    sp_method: str = "snic"
+    # ---------- ASPM ----------
+    feature_dim: int = 64
+    aspm_gfe_channels: int = 16
+    local_variance_kernel: int = 3
+    eca_kernel_size: int = 3
 
-    # BO
-    sp_use_bayes_opt: bool = True
-    sp_bo_sample_blocks: int = 200
-    sp_bo_iter: int = 25
+    # ---------- SNIC ----------
+    # These are explicit reproducibility parameters. If your historical experiment used different
+    # SNIC settings, replace them with the exact original values before regenerating superpixels.
+    snic_num_superpixels: int = 64
+    snic_compactness: float = 10.0
 
-    # 搜索范围
-    sp_segments_min: int = 8
-    sp_segments_max: int = 64
-    sp_compact_min: float = 5.0
-    sp_compact_max: float = 30.0
-
-    # 评分项权重
-    sp_score_lambda_segments: float = 0.002
-    sp_score_w_purity: float = 1.0
-    sp_score_use_edge: bool = True
-    sp_score_w_edge: float = 0.2
-
-    # BO 可视化/记录
-    sp_log_trials: bool = True
-    sp_log_probe_blocks: int = 5
-    sp_viz_every_iter: bool = True
-
-    # -------- LightAGSM（可学习阈值/稀疏率）--------
-    agsm_hidden_dim: int = 64
-    agsm_k: int = 6
-    agsm_rho: float = 0.30
+    # ---------- AGSM: manuscript-aligned defaults ----------
+    knn_k: int = 8
     agsm_temperature: float = 0.5
-    agsm_dropedge_p: float = 0.2
-    agsm_reg_lambda: float = 0.2
+    agsm_dropedge: float = 0.2
+    agsm_depth: int = 2
+    sparsity_target: float = 0.5
+    sparsity_lambda: float = 0.1
+    graph_dropout: float = 0.2
+
+    # ---------- GFM ----------
+    gfm_temperature: float = 0.5
+
+    # ---------- Misc ----------
+    pin_memory: bool = True
+    save_every_epoch_metrics: bool = True
+
+    @property
+    def output_path(self) -> Path:
+        return Path(self.output_dir)
+
+    @property
+    def metadata_path(self) -> Path:
+        return self.output_path / "metadata.json"
+
+    @property
+    def stats_path(self) -> Path:
+        return self.output_path / "dataset_stats.npz"
+
+    @property
+    def split_path(self) -> Path:
+        return self.output_path / "split_manifest.json"
+
+    @property
+    def metrics_dir(self) -> Path:
+        return self.output_path / "metrics"
+
+    @property
+    def confusion_dir(self) -> Path:
+        return self.output_path / "confusion_matrices"
+
+    @property
+    def checkpoints_path(self) -> Path:
+        return self.output_path / self.checkpoint_dir
+
+    @property
+    def pred_save_path(self) -> Path:
+        return self.output_path / self.prediction_name
+
+    def validate(self) -> None:
+        if self.radar_bands != 5:
+            raise ValueError("The manuscript describes a 5-band Sentinel-1 composite.")
+        if self.optical_bands != 10:
+            raise ValueError("This implementation is configured to use all 10 optical bands.")
+        if len(self.optical_band_indices) != self.optical_bands:
+            raise ValueError("optical_band_indices length must equal optical_bands.")
+        if abs(self.train_ratio + self.val_ratio + self.test_ratio - 1.0) > 1e-8:
+            raise ValueError("train_ratio + val_ratio + test_ratio must equal 1.")
+        if self.ignore_index in self.valid_classes:
+            raise ValueError("ignore_index must not be one of valid_classes.")
+
 
 config = Config()
+config.validate()

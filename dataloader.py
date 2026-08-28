@@ -1,197 +1,226 @@
-# -------------------- dataloader.py --------------------
+from __future__ import annotations
+
+import json
+import random
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
 import numpy as np
-import os
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-from configs import config
-from glob import glob
-from typing import Tuple
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+from configs import config
+
+
+def _available_block_ids(block_dir: Path) -> List[int]:
+    ids: List[int] = []
+    for p in block_dir.glob("radar_*.npy"):
+        try:
+            idx = int(p.stem.split("_")[1])
+        except (ValueError, IndexError):
+            continue
+        required = [
+            block_dir / f"optical_{idx}.npy",
+            block_dir / f"label_{idx}.npy",
+            block_dir / f"superpixel_{idx}.npy",
+        ]
+        if all(x.exists() for x in required):
+            ids.append(idx)
+    ids.sort()
+    if not ids:
+        raise RuntimeError(f"No complete radar/optical/label/superpixel blocks found in {block_dir}")
+    return ids
+
+
+def create_or_load_split(block_ids: Sequence[int]) -> Dict[str, List[int]]:
+    if config.split_path.exists():
+        with open(config.split_path, "r", encoding="utf-8") as f:
+            split = json.load(f)
+        return {k: [int(x) for x in v] for k, v in split.items()}
+
+    ids = np.asarray(block_ids, dtype=np.int64)
+    rng = np.random.default_rng(config.split_seed)
+    ids = rng.permutation(ids)
+
+    n = len(ids)
+    n_train = int(round(n * config.train_ratio))
+    n_val = int(round(n * config.val_ratio))
+    n_train = min(n_train, n)
+    n_val = min(n_val, n - n_train)
+
+    split = {
+        "train": ids[:n_train].tolist(),
+        "val": ids[n_train:n_train + n_val].tolist(),
+        "test": ids[n_train + n_val:].tolist(),
+    }
+
+    config.output_path.mkdir(parents=True, exist_ok=True)
+    with open(config.split_path, "w", encoding="utf-8") as f:
+        json.dump(split, f, indent=2)
+    return split
+
+
+def compute_train_statistics(block_dir: Path, train_ids: Sequence[int]) -> Dict[str, np.ndarray]:
+    if config.stats_path.exists():
+        stats = np.load(config.stats_path)
+        return {k: stats[k].astype(np.float32) for k in stats.files}
+
+    radar_sum = np.zeros(config.radar_bands, dtype=np.float64)
+    radar_sq_sum = np.zeros(config.radar_bands, dtype=np.float64)
+    optical_sum = np.zeros(config.optical_bands, dtype=np.float64)
+    optical_sq_sum = np.zeros(config.optical_bands, dtype=np.float64)
+    pixel_count = 0
+
+    for idx in tqdm(train_ids, desc="Computing TRAIN-only normalization statistics"):
+        radar = np.load(block_dir / f"radar_{idx}.npy").astype(np.float64)
+        optical = np.load(block_dir / f"optical_{idx}.npy").astype(np.float64)
+
+        radar_sum += radar.sum(axis=(0, 1))
+        radar_sq_sum += np.square(radar).sum(axis=(0, 1))
+        optical_sum += optical.sum(axis=(0, 1))
+        optical_sq_sum += np.square(optical).sum(axis=(0, 1))
+        pixel_count += radar.shape[0] * radar.shape[1]
+
+    radar_mean = radar_sum / pixel_count
+    radar_var = np.maximum(radar_sq_sum / pixel_count - np.square(radar_mean), 1e-8)
+    optical_mean = optical_sum / pixel_count
+    optical_var = np.maximum(optical_sq_sum / pixel_count - np.square(optical_mean), 1e-8)
+
+    payload = {
+        "radar_mean": radar_mean.astype(np.float32),
+        "radar_std": np.sqrt(radar_var).astype(np.float32),
+        "optical_mean": optical_mean.astype(np.float32),
+        "optical_std": np.sqrt(optical_var).astype(np.float32),
+    }
+    np.savez(config.stats_path, **payload)
+    return payload
+
+
+def compute_class_counts(block_dir: Path, ids: Sequence[int]) -> np.ndarray:
+    counts = np.zeros(config.num_classes, dtype=np.int64)
+    for idx in tqdm(ids, desc="Counting TRAIN labels"):
+        label = np.load(block_dir / f"label_{idx}.npy").astype(np.int64)
+        label = np.where(np.isin(label, config.valid_classes), label, config.ignore_index)
+        unique, c = np.unique(label[label != config.ignore_index], return_counts=True)
+        for cls, n in zip(unique, c):
+            counts[int(cls)] += int(n)
+    return counts
+
+
+def inverse_frequency_weights_mean_one(class_counts: np.ndarray) -> np.ndarray:
+    """ICF weights normalized so the mean weight across valid classes is 1.
+
+    This normalization is consistent with manuscript-style values such as a much larger
+    Suaeda weight than the dominant Phragmites class while preserving the ICF ratios.
+    """
+    weights = np.zeros(config.num_classes, dtype=np.float32)
+    valid = np.asarray(config.valid_classes, dtype=np.int64)
+    counts = class_counts[valid].astype(np.float64)
+    if np.any(counts <= 0):
+        raise ValueError(f"At least one valid class has zero training pixels: {class_counts}")
+    raw = 1.0 / counts
+    raw = raw / raw.mean()
+    weights[valid] = raw.astype(np.float32)
+    return weights
+
+
+def _augment(
+    radar: np.ndarray,
+    optical: np.ndarray,
+    label: np.ndarray,
+    superpixel: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    # Random horizontal/vertical flips + discrete 90-degree rotations.
+    if random.random() < 0.5:
+        radar = np.flip(radar, axis=1)
+        optical = np.flip(optical, axis=1)
+        label = np.flip(label, axis=1)
+        superpixel = np.flip(superpixel, axis=1)
+    if random.random() < 0.5:
+        radar = np.flip(radar, axis=0)
+        optical = np.flip(optical, axis=0)
+        label = np.flip(label, axis=0)
+        superpixel = np.flip(superpixel, axis=0)
+
+    k = random.randint(0, 3)
+    if k:
+        radar = np.rot90(radar, k=k, axes=(0, 1))
+        optical = np.rot90(optical, k=k, axes=(0, 1))
+        label = np.rot90(label, k=k, axes=(0, 1))
+        superpixel = np.rot90(superpixel, k=k, axes=(0, 1))
+
+    return (
+        np.ascontiguousarray(radar),
+        np.ascontiguousarray(optical),
+        np.ascontiguousarray(label),
+        np.ascontiguousarray(superpixel),
+    )
 
 
 class RemoteSensingDataset(Dataset):
-    def __init__(self, block_dir: str, augment: bool = False):
-        self.block_dir = block_dir
-        self.augment = augment  # 开关数据增强
-        self._prepare_indices()
-
-        # 如果是首次运行或重置了数据，重新计算统计量
-        stats_path = os.path.join(self.block_dir, "dataset_stats.npz")
-        if os.path.exists(stats_path):
-            stats = np.load(stats_path)
-            self.radar_mean = stats['radar_mean']
-            self.radar_std = stats['radar_std']
-            self.optical_mean = stats['optical_mean']
-            self.optical_std = stats['optical_std']
-            # 重新计算分布（因为文件变多了）
-            self.class_counts = self._compute_class_distribution()
-        else:
-            self._compute_statistics()
-            self.class_counts = self._compute_class_distribution()
-
-        self._validate_labels()
-
-    def _prepare_indices(self):
-        radar_files = glob(os.path.join(self.block_dir, 'radar_*.npy'))
-        self.block_indices = []
-        for f in radar_files:
-            try:
-                idx = int(os.path.basename(f).split('_')[1].split('.')[0])
-                if os.path.exists(os.path.join(self.block_dir, f'optical_{idx}.npy')) and \
-                        os.path.exists(os.path.join(self.block_dir, f'label_{idx}.npy')):
-                    self.block_indices.append(idx)
-            except:
-                continue
-        self.block_indices = sorted(self.block_indices)
-        print(f"数据集加载完毕，共 {len(self.block_indices)} 个样本")
-
-    def _compute_statistics(self):
-        radar_sum = np.zeros(config.radar_bands, dtype=np.float32)
-        radar_sq_sum = np.zeros(config.radar_bands, dtype=np.float32)
-        optical_sum = np.zeros(config.optical_bands, dtype=np.float32)
-        optical_sq_sum = np.zeros(config.optical_bands, dtype=np.float32)
-        pixel_count = 0
-
-        print("正在计算数据统计量...")
-        # 为了速度，如果是重叠切块，可以只采样部分数据计算均值
-        sample_indices = self.block_indices[::10] if len(self.block_indices) > 2000 else self.block_indices
-
-        for idx in tqdm(sample_indices, desc='进度'):
-            radar = np.load(os.path.join(self.block_dir, f'radar_{idx}.npy')).astype(np.float32)
-            optical = np.load(os.path.join(self.block_dir, f'optical_{idx}.npy')).astype(np.float32)
-            radar_sum += radar.sum(axis=(0, 1))
-            radar_sq_sum += (radar ** 2).sum(axis=(0, 1))
-            optical_sum += optical.sum(axis=(0, 1))
-            optical_sq_sum += (optical ** 2).sum(axis=(0, 1))
-            pixel_count += radar.shape[0] * radar.shape[1]
-
-        self.radar_mean = radar_sum / pixel_count
-        self.radar_std = np.sqrt(np.maximum(radar_sq_sum / pixel_count - self.radar_mean ** 2, 1e-8))
-        self.optical_mean = optical_sum / pixel_count
-        self.optical_std = np.sqrt(np.maximum(optical_sq_sum / pixel_count - self.optical_mean ** 2, 1e-8))
-
-        stats_path = os.path.join(self.block_dir, "dataset_stats.npz")
-        np.savez(
-            stats_path,
-            radar_mean=self.radar_mean.astype(np.float32),
-            radar_std=self.radar_std.astype(np.float32),
-            optical_mean=self.optical_mean.astype(np.float32),
-            optical_std=self.optical_std.astype(np.float32)
-        )
-
-    def _preprocess_label(self, label: np.ndarray) -> np.ndarray:
-        return np.where(np.isin(label, list(config.valid_classes)), label, config.ignore_index)
-
-    def _compute_class_distribution(self):
-        class_counts = np.zeros(config.num_classes, dtype=np.int64)
-        # 采样计算
-        sample_indices = self.block_indices[::5] if len(self.block_indices) > 2000 else self.block_indices
-        for idx in tqdm(sample_indices, desc='统计类别分布'):
-            label = np.load(os.path.join(self.block_dir, f'label_{idx}.npy'))
-            label = self._preprocess_label(label)
-            valid_labels = label[label != config.ignore_index]
-            unique, counts = np.unique(valid_labels, return_counts=True)
-            for u, c in zip(unique, counts):
-                if u < config.num_classes:
-                    class_counts[u] += c
-        return class_counts
-
-    def _validate_labels(self):
-        # 简单抽查
-        print("\n验证标签合法性(抽查)...")
-        idx = self.block_indices[0]
-        label = np.load(os.path.join(self.block_dir, f'label_{idx}.npy'))
-        processed = self._preprocess_label(label)
-        print(f"样本 {idx} 标签唯一值: {np.unique(processed)}")
+    def __init__(
+        self,
+        block_dir: str | Path,
+        block_ids: Sequence[int],
+        stats: Dict[str, np.ndarray],
+        augment: bool = False,
+    ) -> None:
+        self.block_dir = Path(block_dir)
+        self.block_ids = [int(x) for x in block_ids]
+        self.stats = stats
+        self.augment = augment
 
     def __len__(self) -> int:
-        return len(self.block_indices)
+        return len(self.block_ids)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        block_id = self.block_indices[idx]
-        radar = np.load(os.path.join(self.block_dir, f'radar_{block_id}.npy')).astype(np.float32)
-        optical = np.load(os.path.join(self.block_dir, f'optical_{block_id}.npy')).astype(np.float32)
-        label = np.load(os.path.join(self.block_dir, f'label_{block_id}.npy')).astype(np.int64)
-        label = self._preprocess_label(label)
+    def __getitem__(self, i: int):
+        idx = self.block_ids[i]
+        radar = np.load(self.block_dir / f"radar_{idx}.npy").astype(np.float32)
+        optical = np.load(self.block_dir / f"optical_{idx}.npy").astype(np.float32)
+        label = np.load(self.block_dir / f"label_{idx}.npy").astype(np.int64)
+        superpixel = np.load(self.block_dir / f"superpixel_{idx}.npy").astype(np.int64)
 
-        # 标准化
-        radar = (radar - self.radar_mean) / self.radar_std
-        optical = (optical - self.optical_mean) / self.optical_std
+        if radar.shape[-1] != config.radar_bands:
+            raise ValueError(f"Block {idx}: radar shape {radar.shape} does not match {config.radar_bands} bands")
+        if optical.shape[-1] != config.optical_bands:
+            raise ValueError(f"Block {idx}: optical shape {optical.shape} does not match {config.optical_bands} bands")
 
-        # 超像素
-        spx_path = os.path.join(config.superpixel_dir, f'spx_{block_id}.npy')
-        if config.use_superpixels and os.path.exists(spx_path):
-            spx = np.load(spx_path).astype(np.int32)
-        else:
-            h, w = label.shape
-            spx = np.arange(h * w, dtype=np.int32).reshape(h, w)
+        label = np.where(np.isin(label, config.valid_classes), label, config.ignore_index)
 
-        # ================= 数据增强 =================
+        radar = (radar - self.stats["radar_mean"]) / self.stats["radar_std"]
+        optical = (optical - self.stats["optical_mean"]) / self.stats["optical_std"]
+
         if self.augment:
-            # 1. 随机水平翻转
-            if np.random.rand() > 0.5:
-                radar = np.flip(radar, axis=1)
-                optical = np.flip(optical, axis=1)
-                label = np.flip(label, axis=1)
-                spx = np.flip(spx, axis=1)
+            radar, optical, label, superpixel = _augment(radar, optical, label, superpixel)
 
-            # 2. 随机垂直翻转
-            if np.random.rand() > 0.5:
-                radar = np.flip(radar, axis=0)
-                optical = np.flip(optical, axis=0)
-                label = np.flip(label, axis=0)
-                spx = np.flip(spx, axis=0)
-
-            # 3. 随机旋转 90度
-            k = np.random.randint(0, 4)
-            if k > 0:
-                radar = np.rot90(radar, k, axes=(0, 1))
-                optical = np.rot90(optical, k, axes=(0, 1))
-                label = np.rot90(label, k, axes=(0, 1))
-                spx = np.rot90(spx, k, axes=(0, 1))
-
-        # 复制以消除负步长影响
-        radar = radar.copy()
-        optical = optical.copy()
-        label = label.copy()
-        spx = spx.copy()
-        # ===========================================
-
-        radar_tensor = torch.from_numpy(radar).permute(2, 0, 1).float()
-        optical_tensor = torch.from_numpy(optical).permute(2, 0, 1).float()
-        label_tensor = torch.from_numpy(label).long()
-        spx_tensor = torch.from_numpy(spx).long()
-        return radar_tensor, optical_tensor, label_tensor, spx_tensor
+        radar_t = torch.from_numpy(radar).permute(2, 0, 1).float()
+        optical_t = torch.from_numpy(optical).permute(2, 0, 1).float()
+        label_t = torch.from_numpy(label).long()
+        superpixel_t = torch.from_numpy(superpixel).long()
+        return radar_t, optical_t, label_t, superpixel_t, idx
 
 
-def get_dataloaders(block_dir: str, batch_size: int) -> Tuple[DataLoader, DataLoader]:
-    # 训练集开启增强，验证集关闭
-    full_dataset_train = RemoteSensingDataset(block_dir, augment=True)
-    full_dataset_val = RemoteSensingDataset(block_dir, augment=False)
+def get_dataloaders(block_dir: str | Path | None = None):
+    block_dir = Path(block_dir or config.output_dir)
+    ids = _available_block_ids(block_dir)
+    split = create_or_load_split(ids)
+    stats = compute_train_statistics(block_dir, split["train"])
+    class_counts = compute_class_counts(block_dir, split["train"])
+    class_weights = inverse_frequency_weights_mean_one(class_counts)
 
-    val_size = int(len(full_dataset_train) * config.val_ratio)
-    train_size = len(full_dataset_train) - val_size
+    train_ds = RemoteSensingDataset(block_dir, split["train"], stats, augment=True)
+    val_ds = RemoteSensingDataset(block_dir, split["val"], stats, augment=False)
+    test_ds = RemoteSensingDataset(block_dir, split["test"], stats, augment=False)
 
-    # 拆分索引
-    indices = torch.randperm(len(full_dataset_train)).tolist()
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-
-    train_dataset = torch.utils.data.Subset(full_dataset_train, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset_val, val_indices)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
+    common = dict(
+        batch_size=config.batch_size,
         num_workers=config.num_workers,
-        pin_memory=True
+        pin_memory=config.pin_memory,
+        persistent_workers=config.num_workers > 0,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-    return train_loader, val_loader
+    train_loader = DataLoader(train_ds, shuffle=True, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, **common)
+    test_loader = DataLoader(test_ds, shuffle=False, **common)
+
+    return train_loader, val_loader, test_loader, class_counts, class_weights, split, stats
