@@ -1,29 +1,39 @@
 # ASSG-Net: Adaptive Scale and Sparse Graph Network via Gated Fusion for Wetland Vegetation Classification
 
-[![DOI](https://zenodo.org/badge/1174706758.svg)](https://doi.org/10.5281/zenodo.18894511)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PyTorch 1.13.1](https://img.shields.io/badge/PyTorch-1.13.1-EE4C2C.svg)](https://pytorch.org/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18894512.svg)](https://doi.org/10.5281/zenodo.18894512)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-1.13.1-red.svg)
 
-[cite_start]Official PyTorch implementation of the paper **"ASSG-Net: Adaptive Scale and Sparse Graph Network via Gated Fusion for Wetland Vegetation Classification"**[cite: 1, 2, 14].
+Official PyTorch implementation of **"ASSG-Net: Adaptive Scale and Sparse Graph Network via Gated Fusion for Wetland Vegetation Classification"**.
 
 ## 📖 Overview
 
-[cite_start]Accurate classification of fine-scale wetland vegetation is fundamentally constrained by the mismatch between rigid model structures and the complex spatial heterogeneity of coastal landscapes[cite: 11]. [cite_start]**ASSG-Net** resolves these challenges through three synergistic innovations[cite: 40]:
-1. [cite_start]**Physically-Aware Scale Perception Module (ASPM):** Integrates heterogeneity priors to adaptively switch receptive fields, preserving fine-grained features of fragmented vegetation (e.g., *Suaeda salsa*)[cite: 41, 42].
-2. [cite_start]**Topology-Reconstruction Graph Module (AGSM):** Employs a learnable sparsity regularization to dynamically prune low-relevance connections, effectively preventing over-smoothing across ecological boundaries[cite: 43, 44].
-3. [cite_start]**Gated Fusion Module (GFM):** Performs adaptive cross-modal integration via dual-level gating to optimally weigh Sentinel-1 SAR and Sentinel-2 optical features[cite: 45, 46].
+Accurate classification of fine-scale wetland vegetation remains challenging because of strong spatial heterogeneity, fragmented vegetation patches, graph over-smoothing across ecological boundaries, and varying reliability of multi-source remote sensing observations.
 
-[cite_start]With only **0.15 M parameters**, ASSG-Net achieves state-of-the-art accuracy while maintaining high computational efficiency[cite: 20].
+ASSG-Net is a lightweight dual-branch framework for joint learning from Sentinel-1 SAR and Sentinel-2 multispectral imagery. It contains three main components:
 
-## 📂 Repository Structure
+1. **Physically-Aware Scale Perception Module (ASPM)**  
+   ASPM introduces Sobel-edge and local-variance information as explicit spatial heterogeneity priors. Two lightweight depthwise convolution branches with different receptive fields are adaptively selected through pixel-wise gating, helping preserve fine-scale spectral-textural characteristics of fragmented wetland vegetation.
+
+2. **Adaptive Graph Sparsity Module (AGSM)**  
+   Sentinel-1 SAR pixels are first aggregated into SNIC superpixels, which are used as graph nodes. A mutual k-nearest-neighbor graph is constructed from superpixel centroids. AGSM then applies learnable edge gating, sparsity regularization, and DropEdge to suppress low-relevance graph connections and reduce over-smoothing across ecological boundaries.
+
+3. **Gated Fusion Module (GFM)**  
+   GFM integrates SAR-derived graph features and MSI-derived CNN features through global channel gating and local spatial gating. The adaptive fusion mechanism balances complementary spectral and structural information according to their spatially varying discriminative contributions.
+
+ASSG-Net contains approximately **0.142 M trainable parameters** and provides a lightweight solution with competitive wetland vegetation classification performance.
+
+## 📁 Repository Structure
 
 ```text
-├── configs.py               # Hyperparameters and path configurations
-├── dataloader.py            # PyTorch dataset for multi-source remote sensing data
-├── model.py                 # Core architecture (ASPM, LightAGSM, GatedFusion)
-├── preprocess.py            # Data preprocessing & Bayesian Optimization for SNIC
-├── train.py                 # Training script with Focal/Tversky loss and EMA
-├── predict.py               # Inference script using sliding window strategy
-├── plot_bo_convergence.py   # Visualization for Bayesian Optimization trace
-├── requirements.txt         # Environment dependencies
-└── data/                    # Folder for sample Sentinel-1/2 images and ground truth
+├── configs.py              # Hyperparameters, paths, and experiment settings
+├── dataloader.py           # Dataset loading, normalization, augmentation, and class weighting
+├── model.py                # ASSG-Net: ASPM, AGSM, GFM, and classifier
+├── snic.py                 # SNIC superpixel generation
+├── preprocess.py           # Data preprocessing and superpixel preparation
+├── train.py                # Model training and evaluation
+├── predict.py              # Model inference and classification-map generation
+├── analyze_gates.py        # Analysis of ASPM, AGSM, and GFM gating behavior
+├── requirements.txt        # Python dependencies
+├── README.md               # Project documentation
+└── Data.zip                # Example / accompanying dataset files
